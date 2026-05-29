@@ -3,6 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const DIAGNOSE = process.argv.includes('--diagnose');
+const HEADLESS = !process.argv.includes('--headed');
+
 const CONFIG = {
   baseUrl: 'https://pims.housingandurban.go.ke/home',
   loginUrl: 'https://pims.housingandurban.go.ke/home',
@@ -11,9 +14,8 @@ const CONFIG = {
   storageStatePath: path.join(process.cwd(), 'storageState.json'),
   maxPages: 300,
   maxDepth: 5,
-  headless: true,
-  // Use pre-installed Chromium if playwright's own binary is unavailable
-  executablePath: process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
+  headless: HEADLESS,
+  executablePath: process.env.CHROME_PATH || undefined,
 };
 
 const visited = new Set();
@@ -25,9 +27,9 @@ let errorCount = 0;
 function sanitizePath(url) {
   try {
     const u = new URL(url);
-    let p = u.pathname + (u.hash ? u.hash.replace('#', '/hash/') : '');
+    let p = u.pathname + (u.hash ? u.hash.replace('#', '_hash_') : '');
     p = p.replace(/^\//, '').replace(/\//g, '_').replace(/[^a-zA-Z0-9_\-]/g, '_') || 'index';
-    return p;
+    return p || 'index';
   } catch {
     return 'unknown_' + Date.now();
   }
@@ -37,8 +39,7 @@ function normalizeUrl(url, base) {
   try {
     const u = new URL(url, base);
     u.hash = '';
-    // Remove common tracking params
-    ['utm_source','utm_medium','utm_campaign','_','timestamp'].forEach(p => u.searchParams.delete(p));
+    ['utm_source', 'utm_medium', 'utm_campaign', '_', 'timestamp'].forEach(p => u.searchParams.delete(p));
     return u.toString();
   } catch {
     return null;
@@ -60,8 +61,8 @@ async function injectStabilityCSS(page) {
       animation-delay: 0s !important;
       transition-duration: 0s !important;
       transition-delay: 0s !important;
-    }`
-  });
+    }`,
+  }).catch(() => {});
 }
 
 async function scrollPage(page) {
@@ -77,231 +78,338 @@ async function scrollPage(page) {
           window.scrollTo(0, 0);
           resolve();
         }
-      }, 50);
-      setTimeout(() => { clearInterval(timer); window.scrollTo(0, 0); resolve(); }, 5000);
+      }, 80);
+      setTimeout(() => { clearInterval(timer); window.scrollTo(0, 0); resolve(); }, 8000);
     });
-  });
+  }).catch(() => {});
 }
 
 async function takeScreenshot(page, filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   await page.screenshot({ path: filePath, fullPage: true });
   screenshotCount++;
-  console.log(`  📸 Screenshot saved: ${filePath}`);
+  console.log(`  📸 ${filePath}`);
 }
 
-async function captureUIStates(page, baseDir, baseName, url) {
+async function captureUIStates(page, baseDir, baseName) {
   const screenshots = ['base'];
-  const baseFile = path.join(baseDir, baseName + '.png');
-  await takeScreenshot(page, baseFile);
+  await takeScreenshot(page, path.join(baseDir, baseName + '.png'));
 
-  // Try to capture modals
-  const modalTriggers = await page.$$('[data-toggle="modal"], [data-bs-toggle="modal"], .btn[href*="#"], button.modal-trigger');
+  // Modals
+  const modalTriggers = await page.$$('[data-toggle="modal"], [data-bs-toggle="modal"], button.modal-trigger').catch(() => []);
   for (let i = 0; i < Math.min(modalTriggers.length, 3); i++) {
     try {
       await modalTriggers[i].click();
-      await page.waitForTimeout(500);
-      const modal = await page.$('.modal.show, .modal[style*="display: block"], [role="dialog"]:visible');
+      await page.waitForTimeout(600);
+      const modal = await page.$('.modal.show, [role="dialog"]').catch(() => null);
       if (modal) {
-        const modalFile = path.join(baseDir, `${baseName}_modal_${i}.png`);
-        await takeScreenshot(page, modalFile);
+        const f = path.join(baseDir, `${baseName}_modal_${i}.png`);
+        await takeScreenshot(page, f);
         screenshots.push(`modal_${i}`);
-        // Close modal
-        const closeBtn = await page.$('.modal.show .close, .modal.show [data-dismiss="modal"], .modal.show [data-bs-dismiss="modal"]');
-        if (closeBtn) await closeBtn.click();
+        const closeBtn = await page.$('.modal.show .btn-close, .modal.show [data-dismiss="modal"], .modal.show [data-bs-dismiss="modal"], .modal.show .close').catch(() => null);
+        if (closeBtn) await closeBtn.click().catch(() => {});
         else await page.keyboard.press('Escape');
+        await page.waitForTimeout(400);
+      }
+    } catch {}
+  }
+
+  // Dropdowns
+  const dropdowns = await page.$$('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle').catch(() => []);
+  for (let i = 0; i < Math.min(dropdowns.length, 3); i++) {
+    try {
+      await dropdowns[i].click();
+      await page.waitForTimeout(400);
+      const menu = await page.$('.dropdown-menu.show').catch(() => null);
+      if (menu) {
+        const f = path.join(baseDir, `${baseName}_dropdown_${i}.png`);
+        await takeScreenshot(page, f);
+        screenshots.push(`dropdown_${i}`);
+        await dropdowns[i].click().catch(() => {});
         await page.waitForTimeout(300);
       }
     } catch {}
   }
 
-  // Try to capture dropdowns
-  const dropdowns = await page.$$('[data-toggle="dropdown"], [data-bs-toggle="dropdown"], .dropdown-toggle');
-  for (let i = 0; i < Math.min(dropdowns.length, 3); i++) {
-    try {
-      await dropdowns[i].click();
-      await page.waitForTimeout(400);
-      const menu = await page.$('.dropdown-menu.show, .dropdown-menu[style*="display: block"]');
-      if (menu) {
-        const ddFile = path.join(baseDir, `${baseName}_dropdown_${i}.png`);
-        await takeScreenshot(page, ddFile);
-        screenshots.push(`dropdown_${i}`);
-        await dropdowns[i].click();
-        await page.waitForTimeout(200);
-      }
-    } catch {}
-  }
-
-  // Try expandable sections
-  const expandables = await page.$$('[data-toggle="collapse"], [data-bs-toggle="collapse"], .accordion-button:not(.active), details summary');
+  // Expandable / accordion
+  const expandables = await page.$$('[data-toggle="collapse"], [data-bs-toggle="collapse"], .accordion-button, details summary').catch(() => []);
   for (let i = 0; i < Math.min(expandables.length, 3); i++) {
     try {
       await expandables[i].click();
       await page.waitForTimeout(400);
-      const expFile = path.join(baseDir, `${baseName}_expanded_${i}.png`);
-      await takeScreenshot(page, expFile);
+      const f = path.join(baseDir, `${baseName}_expanded_${i}.png`);
+      await takeScreenshot(page, f);
       screenshots.push(`expanded_${i}`);
-      await expandables[i].click();
-      await page.waitForTimeout(200);
+      await expandables[i].click().catch(() => {});
+      await page.waitForTimeout(300);
     } catch {}
   }
 
   return screenshots;
 }
 
-async function discoverLinks(page, currentUrl) {
-  const links = await page.evaluate((base) => {
+async function discoverLinks(page) {
+  return page.evaluate(() => {
     const anchors = Array.from(document.querySelectorAll('a[href]'));
-    return anchors.map(a => a.href).filter(h => h && !h.startsWith('javascript:') && !h.startsWith('mailto:') && !h.startsWith('tel:'));
-  }, currentUrl);
-  return links;
+    return anchors
+      .map(a => a.href)
+      .filter(h => h && !h.startsWith('javascript:') && !h.startsWith('mailto:') && !h.startsWith('tel:'));
+  }).catch(() => []);
 }
 
-async function login(browser) {
-  console.log('🔐 Logging in...');
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
-  const page = await context.newPage();
+async function discoverNavLinks(page) {
+  return page.evaluate(() => {
+    const sel = '.sidebar a, nav a, .navbar a, .menu a, [class*="sidebar"] a, [class*="nav-"] a, [id*="sidebar"] a, [id*="menu"] a';
+    return Array.from(document.querySelectorAll(sel))
+      .map(a => a.href)
+      .filter(h => h && !h.startsWith('javascript:') && !h.startsWith('mailto:'));
+  }).catch(() => []);
+}
+
+// ─── Diagnose mode ───────────────────────────────────────────────────────────
+async function diagnose() {
+  console.log('\n🔬 DIAGNOSE MODE — inspecting login page\n');
+  const browser = await chromium.launch({ headless: false, executablePath: CONFIG.executablePath });
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+  const page = await ctx.newPage();
 
   await page.goto(CONFIG.loginUrl, { waitUntil: 'networkidle', timeout: 30000 });
+  console.log('URL after load:', page.url());
 
-  // Save login page screenshot
+  const inputs = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('input')).map(i => ({
+      tag: 'input', type: i.type, name: i.name, id: i.id, placeholder: i.placeholder, className: i.className,
+    }))
+  );
+  const buttons = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('button, input[type=submit]')).map(b => ({
+      tag: b.tagName, type: b.type, text: b.innerText?.trim(), id: b.id, className: b.className,
+    }))
+  );
+  const forms = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('form')).map(f => ({
+      id: f.id, action: f.action, method: f.method, className: f.className,
+    }))
+  );
+
+  console.log('\n📋 Forms found:');
+  console.log(JSON.stringify(forms, null, 2));
+  console.log('\n📋 Inputs found:');
+  console.log(JSON.stringify(inputs, null, 2));
+  console.log('\n📋 Buttons found:');
+  console.log(JSON.stringify(buttons, null, 2));
+
+  const diagDir = path.join(CONFIG.outputDir, 'diagnose');
+  fs.mkdirSync(diagDir, { recursive: true });
+  const diagFile = path.join(diagDir, 'login_page.png');
+  await page.screenshot({ path: diagFile, fullPage: true });
+  console.log(`\n📸 Login page screenshot: ${diagFile}`);
+
+  // Save full HTML for inspection
+  const html = await page.content();
+  fs.writeFileSync(path.join(diagDir, 'login_page.html'), html);
+  console.log(`📄 Login page HTML: ${path.join(diagDir, 'login_page.html')}`);
+
+  await browser.close();
+  console.log('\n✅ Diagnose complete. Check the output above and fix selectors in crawler.js if needed.');
+}
+
+// ─── Login ───────────────────────────────────────────────────────────────────
+async function login(browser) {
+  console.log('🔐 Logging in...');
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+  const page = await ctx.newPage();
   const loginDir = path.join(CONFIG.outputDir, 'auth');
   fs.mkdirSync(loginDir, { recursive: true });
-  await page.screenshot({ path: path.join(loginDir, 'login.png'), fullPage: true });
+
+  await page.goto(CONFIG.loginUrl, { waitUntil: 'networkidle', timeout: 30000 });
+  console.log('  Initial URL:', page.url());
+  await page.screenshot({ path: path.join(loginDir, '01_login_page.png'), fullPage: true });
   screenshotCount++;
 
-  // Try various login field selectors
-  const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]', 'input[id*="user"]', 'input[id*="login"]', '#username', '#email'];
-  const passwordSelectors = ['input[name="password"]', 'input[type="password"]', '#password'];
+  // Collect all inputs visible on the page
+  const allInputs = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('input:not([type=hidden])'))
+      .map(i => ({ type: i.type, name: i.name, id: i.id, placeholder: i.placeholder }))
+  );
+  console.log('  Inputs on page:', JSON.stringify(allInputs));
 
-  let loggedIn = false;
-  for (const uSel of usernameSelectors) {
+  // Build selectors from actual page inputs
+  const textInputSels = [
+    'input[name="username"]', 'input[name="user"]', 'input[name="login"]',
+    'input[name="email"]', 'input[type="email"]', 'input[type="text"]',
+    'input[id*="user" i]', 'input[id*="login" i]', 'input[id*="email" i]',
+    'input[placeholder*="user" i]', 'input[placeholder*="email" i]', 'input[placeholder*="login" i]',
+  ];
+  const passSels = [
+    'input[name="password"]', 'input[type="password"]',
+    'input[id*="pass" i]', 'input[placeholder*="pass" i]',
+  ];
+  const submitSels = [
+    'button[type="submit"]', 'input[type="submit"]',
+    'button:has-text("Login")', 'button:has-text("Sign in")', 'button:has-text("Log in")',
+    'button:has-text("Submit")', '.btn-primary', '.login-btn', '[class*="login" i] button',
+  ];
+
+  let userFilled = false;
+  let passFilled = false;
+
+  for (const sel of textInputSels) {
     try {
-      await page.fill(uSel, CONFIG.credentials.username, { timeout: 2000 });
-      for (const pSel of passwordSelectors) {
-        try {
-          await page.fill(pSel, CONFIG.credentials.password, { timeout: 2000 });
-          await page.screenshot({ path: path.join(loginDir, 'login_filled.png'), fullPage: true });
-          screenshotCount++;
-          await page.keyboard.press('Enter');
-          await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
-          await page.waitForTimeout(2000);
-
-          const currentUrl = page.url();
-          if (!currentUrl.includes('login') && !currentUrl.includes('signin')) {
-            loggedIn = true;
-            break;
-          }
-          // Try submit button
-          const submitBtn = await page.$('button[type="submit"], input[type="submit"], .btn-login, .btn-primary');
-          if (submitBtn) {
-            await submitBtn.click();
-            await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
-            await page.waitForTimeout(2000);
-            if (!page.url().includes('login')) { loggedIn = true; break; }
-          }
-        } catch {}
-      }
-      if (loggedIn) break;
+      await page.fill(sel, CONFIG.credentials.username, { timeout: 1500 });
+      console.log(`  ✅ Username filled using: ${sel}`);
+      userFilled = true;
+      break;
     } catch {}
   }
 
-  if (!loggedIn) {
-    console.log('⚠️  Standard login failed, attempting form submission...');
-    // Take screenshot to debug
-    await page.screenshot({ path: path.join(loginDir, 'login_debug.png'), fullPage: true });
+  for (const sel of passSels) {
+    try {
+      await page.fill(sel, CONFIG.credentials.password, { timeout: 1500 });
+      console.log(`  ✅ Password filled using: ${sel}`);
+      passFilled = true;
+      break;
+    } catch {}
   }
 
-  console.log(`✅ Post-login URL: ${page.url()}`);
-  await page.screenshot({ path: path.join(loginDir, 'post_login.png'), fullPage: true });
+  if (!userFilled || !passFilled) {
+    console.log('  ⚠️  Could not fill credentials. Run with --diagnose to inspect the login page.');
+    await page.screenshot({ path: path.join(loginDir, '02_fill_failed.png'), fullPage: true });
+    screenshotCount++;
+    await ctx.close();
+    return false;
+  }
+
+  await page.screenshot({ path: path.join(loginDir, '02_credentials_filled.png'), fullPage: true });
   screenshotCount++;
 
-  await context.storageState({ path: CONFIG.storageStatePath });
-  console.log(`💾 Session saved to ${CONFIG.storageStatePath}`);
-  await context.close();
+  // Try submit button first, fall back to Enter
+  let submitted = false;
+  for (const sel of submitSels) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        submitted = true;
+        console.log(`  ✅ Submitted via: ${sel}`);
+        break;
+      }
+    } catch {}
+  }
+  if (!submitted) {
+    await page.keyboard.press('Enter');
+    console.log('  ✅ Submitted via Enter key');
+  }
+
+  // Wait for navigation / SPA route change
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
+    page.waitForTimeout(8000),
+  ]).catch(() => {});
+  await page.waitForTimeout(2000);
+
+  const postUrl = page.url();
+  console.log('  Post-login URL:', postUrl);
+  await page.screenshot({ path: path.join(loginDir, '03_post_login.png'), fullPage: true });
+  screenshotCount++;
+
+  // Detect success: URL changed OR login form is gone OR dashboard element present
+  const loginFormGone = await page.$('input[type="password"]').then(el => !el).catch(() => true);
+  const urlChanged = postUrl !== CONFIG.loginUrl;
+  const hasDashboard = await page.$('[class*="dashboard"], [class*="sidebar"], [id*="sidebar"], nav.main-nav, .main-content').then(Boolean).catch(() => false);
+
+  const success = urlChanged || loginFormGone || hasDashboard;
+  console.log(`  Login detection → urlChanged:${urlChanged} loginFormGone:${loginFormGone} hasDashboard:${hasDashboard}`);
+  console.log(success ? '  ✅ Login successful' : '  ❌ Login appears to have failed');
+
+  await ctx.storageState({ path: CONFIG.storageStatePath });
+  console.log(`  💾 Session saved to ${CONFIG.storageStatePath}`);
+  await ctx.close();
+  return success;
 }
 
+// ─── Crawl ───────────────────────────────────────────────────────────────────
 async function crawl() {
   const browser = await chromium.launch({ headless: CONFIG.headless, executablePath: CONFIG.executablePath });
 
-  // Login first
-  await login(browser);
-
-  // Create context with saved session
-  const context = await browser.newContext({ storageState: CONFIG.storageStatePath, ignoreHTTPSErrors: true });
-  const page = await context.newPage();
-
-  const queue = [{ url: CONFIG.baseUrl, depth: 0, source: 'start' }];
-  visited.add(normalizeUrl(CONFIG.baseUrl, CONFIG.baseUrl));
-
-  console.log('\n🚀 Starting crawl...\n');
-
-  const guessedUrls = [
-    '/users', '/settings', '/dashboard', '/reports', '/billing',
-    '/admin', '/profile', '/home', '/index', '/main'
-  ].map(p => {
-    try { return new URL(p, CONFIG.baseUrl).toString(); } catch { return null; }
-  }).filter(Boolean);
-
-  for (const u of guessedUrls) {
-    const norm = normalizeUrl(u, CONFIG.baseUrl);
-    if (norm && !visited.has(norm)) {
-      queue.push({ url: norm, depth: 1, source: 'guessed' });
-    }
+  const loginOk = await login(browser);
+  if (!loginOk) {
+    console.log('\n❌ Aborting crawl — login failed. Run with --diagnose to inspect the login page.');
+    await browser.close();
+    process.exit(1);
   }
+
+  const ctx = await browser.newContext({ storageState: CONFIG.storageStatePath, ignoreHTTPSErrors: true });
+  const page = await ctx.newPage();
+
+  // Verify session is still authenticated after context restore
+  await page.goto(CONFIG.baseUrl, { waitUntil: 'networkidle', timeout: 20000 });
+  const sessionCheck = await page.$('input[type="password"]').then(el => !el).catch(() => true);
+  if (!sessionCheck) {
+    console.log('⚠️  Session check failed — may not be authenticated, continuing anyway...');
+  }
+
+  const startUrl = normalizeUrl(page.url(), CONFIG.baseUrl) || normalizeUrl(CONFIG.baseUrl, CONFIG.baseUrl);
+  const queue = [{ url: startUrl, depth: 0, source: 'start' }];
+  visited.add(startUrl);
+
+  // Seed with common URL patterns
+  const guessed = [
+    '/dashboard', '/home', '/index', '/main', '/users', '/user',
+    '/settings', '/reports', '/report', '/billing', '/admin',
+    '/profile', '/projects', '/project', '/tasks', '/task',
+    '/documents', '/notifications', '/search',
+  ];
+  for (const p of guessed) {
+    try {
+      const u = normalizeUrl(new URL(p, CONFIG.baseUrl).toString(), CONFIG.baseUrl);
+      if (u && !visited.has(u)) queue.push({ url: u, depth: 1, source: 'guessed' });
+    } catch {}
+  }
+
+  console.log(`\n🚀 Starting crawl from ${startUrl}\n`);
 
   while (queue.length > 0 && visited.size <= CONFIG.maxPages) {
     const { url, depth, source } = queue.shift();
     const normUrl = normalizeUrl(url, CONFIG.baseUrl);
-
     if (!normUrl || visited.has(normUrl) || !isSameDomain(normUrl, CONFIG.baseUrl)) continue;
     visited.add(normUrl);
 
-    console.log(`\n[${visited.size}/${CONFIG.maxPages}] Visiting (depth ${depth}): ${normUrl}`);
-    console.log(`  Source: ${source}`);
+    console.log(`\n[${visited.size}/${CONFIG.maxPages}] depth:${depth} src:${source}`);
+    console.log(`  URL: ${normUrl}`);
 
     let success = false;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await page.goto(normUrl, { waitUntil: 'networkidle', timeout: 20000 });
+        await page.goto(normUrl, { waitUntil: 'networkidle', timeout: 25000 });
+
+        // Skip if redirected back to login
+        const redirectedToLogin = await page.$('input[type="password"]').then(Boolean).catch(() => false);
+        if (redirectedToLogin) {
+          console.log('  ⚠️  Redirected to login — skipping');
+          success = true; // don't retry, just skip
+          break;
+        }
+
         await injectStabilityCSS(page);
         await scrollPage(page);
         await page.waitForTimeout(500);
 
-        const sanitized = sanitizePath(normUrl);
-        const pageDir = CONFIG.outputDir;
-        const baseName = sanitized;
+        const title = await page.title().catch(() => 'Unknown');
+        const baseName = sanitizePath(normUrl);
+        const screenshots = await captureUIStates(page, CONFIG.outputDir, baseName);
 
-        const screenshots = await captureUIStates(page, pageDir, baseName, normUrl);
+        pageIndex[normUrl] = { screenshots, discovered_from: [source], depth, title };
+        navigationTree.push({ url: normUrl, title, screenshots, source, depth });
 
-        pageIndex[normUrl] = {
-          screenshots,
-          discovered_from: [source],
-          depth,
-          title: await page.title().catch(() => 'Unknown'),
-        };
-
-        navigationTree.push({ url: normUrl, screenshots, source, depth });
-
-        // Discover new links
         if (depth < CONFIG.maxDepth) {
-          const links = await discoverLinks(page, normUrl);
-          for (const link of links) {
-            const norm = normalizeUrl(link, normUrl);
-            if (norm && !visited.has(norm) && isSameDomain(norm, CONFIG.baseUrl)) {
-              queue.push({ url: norm, depth: depth + 1, source: 'crawl' });
-            }
-          }
-
-          // Also check sidebar/nav specific elements
-          const navLinks = await page.evaluate(() => {
-            const els = document.querySelectorAll('.sidebar a, .nav a, .navbar a, .menu a, [class*="sidebar"] a, [class*="nav"] a');
-            return Array.from(els).map(a => a.href).filter(h => h && !h.startsWith('javascript:'));
-          });
-          for (const link of navLinks) {
-            const norm = normalizeUrl(link, normUrl);
-            if (norm && !visited.has(norm) && isSameDomain(norm, CONFIG.baseUrl)) {
-              queue.push({ url: norm, depth: depth + 1, source: 'sidebar' });
+          const links = await discoverLinks(page);
+          const navLinks = await discoverNavLinks(page);
+          for (const link of [...links, ...navLinks]) {
+            const n = normalizeUrl(link, normUrl);
+            if (n && !visited.has(n) && isSameDomain(n, CONFIG.baseUrl)) {
+              const src = navLinks.includes(link) ? 'sidebar' : 'crawl';
+              queue.push({ url: n, depth: depth + 1, source: src });
             }
           }
         }
@@ -309,69 +417,79 @@ async function crawl() {
         success = true;
         break;
       } catch (err) {
-        console.log(`  ⚠️  Attempt ${attempt + 1} failed: ${err.message}`);
-        if (attempt === 0) await page.waitForTimeout(1000);
+        console.log(`  ⚠️  Attempt ${attempt + 1}: ${err.message.split('\n')[0]}`);
+        if (attempt === 0) await page.waitForTimeout(1500);
       }
     }
 
     if (!success) {
       errorCount++;
-      console.log(`  ❌ Skipping ${normUrl} after 2 failures`);
+      console.log(`  ❌ Skipped after retries`);
     }
   }
 
-  await context.close();
+  await ctx.close();
   await browser.close();
 
-  // Generate output files
   generateNavigationMap();
   generateIndexJson();
 
-  console.log('\n✅ Crawl complete!');
-  console.log(`  Total pages discovered: ${visited.size}`);
-  console.log(`  Total screenshots captured: ${screenshotCount}`);
-  console.log(`  Errors encountered: ${errorCount}`);
+  console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('✅ Crawl complete!');
+  console.log(`   Pages discovered : ${visited.size}`);
+  console.log(`   Screenshots saved: ${screenshotCount}`);
+  console.log(`   Errors           : ${errorCount}`);
+  console.log(`   Output directory : ${CONFIG.outputDir}`);
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 }
 
+// ─── Output generators ───────────────────────────────────────────────────────
 function generateNavigationMap() {
-  const lines = ['# Navigation Map\n', `Generated: ${new Date().toISOString()}\n`];
+  const lines = [
+    '# PIMS Navigation Map',
+    '',
+    `> Generated: ${new Date().toISOString()}`,
+    `> Total pages: ${navigationTree.length}`,
+    '',
+  ];
 
-  // Group by depth
   const byDepth = {};
   for (const item of navigationTree) {
-    if (!byDepth[item.depth]) byDepth[item.depth] = [];
-    byDepth[item.depth].push(item);
+    (byDepth[item.depth] = byDepth[item.depth] || []).push(item);
   }
 
-  for (const depth of Object.keys(byDepth).sort()) {
-    lines.push(`\n## Depth ${depth}\n`);
+  for (const depth of Object.keys(byDepth).sort((a, b) => a - b)) {
+    lines.push(`## Depth ${depth}`);
+    lines.push('');
     for (const item of byDepth[depth]) {
-      lines.push(`### ${item.url}`);
+      lines.push(`### ${item.title || item.url}`);
+      lines.push(`- **URL**: \`${item.url}\``);
       lines.push(`- **Source**: ${item.source}`);
       lines.push(`- **Screenshots**:`);
       for (const s of item.screenshots) {
-        lines.push(`  - ${s}`);
+        const file = `${sanitizePath(item.url)}${s === 'base' ? '' : '_' + s}.png`;
+        lines.push(`  - [\`${file}\`](./${file})`);
       }
       lines.push('');
     }
   }
 
-  const mapPath = path.join(CONFIG.outputDir, 'navigation-map.md');
-  fs.writeFileSync(mapPath, lines.join('\n'));
-  console.log(`\n📄 Navigation map saved: ${mapPath}`);
+  const out = path.join(CONFIG.outputDir, 'navigation-map.md');
+  fs.writeFileSync(out, lines.join('\n'));
+  console.log(`\n📄 Navigation map: ${out}`);
 }
 
 function generateIndexJson() {
-  const indexPath = path.join(CONFIG.outputDir, 'index.json');
-  fs.writeFileSync(indexPath, JSON.stringify(pageIndex, null, 2));
-  console.log(`📄 Index JSON saved: ${indexPath}`);
+  const out = path.join(CONFIG.outputDir, 'index.json');
+  fs.writeFileSync(out, JSON.stringify(pageIndex, null, 2));
+  console.log(`📄 Index JSON     : ${out}`);
 }
 
-// Create output directory
+// ─── Entry point ─────────────────────────────────────────────────────────────
 fs.mkdirSync(CONFIG.outputDir, { recursive: true });
 
-// Run
-crawl().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+if (DIAGNOSE) {
+  diagnose().catch(err => { console.error('Fatal:', err); process.exit(1); });
+} else {
+  crawl().catch(err => { console.error('Fatal:', err); process.exit(1); });
+}
