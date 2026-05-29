@@ -159,7 +159,7 @@ async function discoverLinks(page, currentUrl) {
 
 async function login(browser) {
   console.log('🔐 Logging in...');
-  const context = await browser.newContext();
+  const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
 
   await page.goto(CONFIG.loginUrl, { waitUntil: 'networkidle', timeout: 30000 });
@@ -228,7 +228,7 @@ async function crawl() {
   await login(browser);
 
   // Create context with saved session
-  const context = await browser.newContext({ storageState: CONFIG.storageStatePath });
+  const context = await browser.newContext({ storageState: CONFIG.storageStatePath, ignoreHTTPSErrors: true });
   const page = await context.newPage();
 
   const queue = [{ url: CONFIG.baseUrl, depth: 0, source: 'start' }];
