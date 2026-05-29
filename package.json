@@ -1,0 +1,13 @@
+{
+  "name": "pims-crawler",
+  "version": "1.0.0",
+  "description": "Playwright-based crawler for PIMS application documentation",
+  "main": "crawler.js",
+  "scripts": {
+    "crawl": "node crawler.js",
+    "crawl:debug": "HEADLESS=false node crawler.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}
